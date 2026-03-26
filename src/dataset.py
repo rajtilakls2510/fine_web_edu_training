@@ -10,7 +10,7 @@ BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
 PAD_TOKEN = "<pad>"
 
-CONTEXT_SIZE = 512+1
+CONTEXT_SIZE = 1024+1
 
 class FineWebIterableDataset(torch.utils.data.IterableDataset):
 
@@ -75,7 +75,7 @@ if __name__ == "__main__":
     start_time = time.time()
     num_batches = 0
     for batch_idx, batch in enumerate(
-        torch.utils.data.DataLoader(ds, num_workers=20, batch_size=1024)
+        torch.utils.data.DataLoader(ds, num_workers=20, batch_size=256)
     ):
         num_batches += 1
 
