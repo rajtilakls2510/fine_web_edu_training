@@ -3,7 +3,9 @@ import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 from tokenizers import Tokenizer
 from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
 from dataset import FineWebIterableDataset
+import time
 
 MODEL_PATH = "./models/my_new_model"
 CHECKPOINT_DIR = "./checkpoints"
@@ -15,7 +17,7 @@ BATCH_SIZE = 16
 CONTEXT_SIZE = 512
 GRAD_ACCUM_STEPS = 256
 NUM_WORKERS = 10
-LR = 1e-4
+LR = 1e-3
 MAX_GRAD_NORM = 1.0
 
 SAVE_EVERY = 1000   # steps
@@ -45,9 +47,22 @@ def get_latest_checkpoint():
 def main():
     print("Starting training...")
 
+    project_config = ProjectConfiguration(project_dir=".", logging_dir="logs")
     accelerator = Accelerator(
         gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+        log_with="tensorboard",
+        project_config=project_config
         # mixed_precision="bf16"   # optional
+    )
+
+    accelerator.init_trackers(
+        project_name="gpt2-from-scratch",
+        config={
+            "lr": LR,
+            "batch_size": BATCH_SIZE,
+            "context_size": CONTEXT_SIZE,
+            "grad_accum": GRAD_ACCUM_STEPS,
+        },
     )
 
     # ============================================================
@@ -83,6 +98,12 @@ def main():
 
     model = GPT2LMHeadModel(config)
 
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    accelerator.print(f"Total params: {total_params:,}")
+    accelerator.print(f"Trainable params: {trainable_params:,}")
+
     # Optional memory optimization
     model.gradient_checkpointing_enable()
 
@@ -117,6 +138,8 @@ def main():
     # ============================================================
     # TRAIN LOOP
     # ============================================================
+    start_time = time.time()
+    grad_norm = None
     for step, batch in enumerate(loader, start=global_step):
 
         with accelerator.accumulate(model):
@@ -131,7 +154,7 @@ def main():
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
 
             optimizer.step()
             optimizer.zero_grad()
@@ -144,6 +167,22 @@ def main():
         # ========================================================
         if step % 10 == 0:
             accelerator.print(f"Step {step} | Loss: {loss.item():.4f}")
+            
+            elapsed = time.time() - start_time
+            tokens = BATCH_SIZE * CONTEXT_SIZE * GRAD_ACCUM_STEPS
+            tokens_per_sec = tokens / elapsed
+
+            accelerator.log(
+                {
+                    "loss": loss.item(),
+                    "lr": scheduler.get_last_lr()[0],
+                    "grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
+                    "tokens/sec": tokens_per_sec,
+                },
+                step=step
+            )
+
+            start_time = time.time()
 
         # ========================================================
         # SAVE CHECKPOINT
