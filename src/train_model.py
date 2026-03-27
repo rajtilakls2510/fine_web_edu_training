@@ -20,7 +20,7 @@ NUM_WORKERS = 10
 LR = 1e-3
 MAX_GRAD_NORM = 1.0
 
-SAVE_EVERY = 1000   # steps
+SAVE_EVERY = 1024   # steps
 
 UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
@@ -140,7 +140,7 @@ def main():
     # ============================================================
     start_time = time.time()
     grad_norm = None
-    for step, batch in enumerate(loader, start=global_step):
+    for step, batch in enumerate(loader, start=global_step+1):
 
         with accelerator.accumulate(model):
 
@@ -195,6 +195,11 @@ def main():
             accelerator.print(f"Saving checkpoint at step {step}")
 
             accelerator.save_state(ckpt_path)
+
+            # Inference checkpoint
+            if accelerator.is_main_process:
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save_pretrained(MODEL_PATH)
 
     # ============================================================
     # FINAL SAVE
