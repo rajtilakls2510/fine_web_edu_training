@@ -6,6 +6,7 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 from dataset import FineWebIterableDataset
 import time
+import json
 
 MODEL_PATH = "./models/my_new_model"
 CHECKPOINT_DIR = "./checkpoints"
@@ -13,6 +14,7 @@ CHECKPOINT_DIR = "./checkpoints"
 TOKENIZER_PATH = "./models/tokenizer.json"
 DATA_PATH = "./data/fine_web_data/data/CC-MAIN-2025-26"
 
+NUM_EPOCHS = 5
 BATCH_SIZE = 16
 CONTEXT_SIZE = 512
 GRAD_ACCUM_STEPS = 256
@@ -126,6 +128,7 @@ def main():
     # RESUME FROM CHECKPOINT
     # ============================================================
     global_step = 0
+    start_epoch = 0
 
     latest_ckpt = get_latest_checkpoint()
 
@@ -133,73 +136,95 @@ def main():
         accelerator.print(f"Resuming from {latest_ckpt}")
         accelerator.load_state(latest_ckpt)
 
-        global_step = int(latest_ckpt.split("_")[-1])
+        # Load metadata
+        meta_path = os.path.join(latest_ckpt, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+
+            global_step = meta["global_step"]
+            start_epoch = meta["epoch"]
+
+        accelerator.print(f"Resumed at step {global_step}, epoch {start_epoch}")
 
     # ============================================================
     # TRAIN LOOP
     # ============================================================
     start_time = time.time()
     grad_norm = None
-    for step, batch in enumerate(loader, start=global_step+1):
 
-        with accelerator.accumulate(model):
+    for epoch in range(start_epoch, NUM_EPOCHS):
 
-            outputs = model(
-                input_ids=batch[:, :-1],
-                labels=batch[:, 1:]
-            )
+        accelerator.print(f"\nStarting epoch {epoch}")
+        
+        for global_step, batch in enumerate(loader, start=global_step):
 
-            loss = outputs.loss
+            with accelerator.accumulate(model):
 
-            accelerator.backward(loss)
+                outputs = model(
+                    input_ids=batch[:, :-1],
+                    labels=batch[:, 1:]
+                )
 
-            if accelerator.sync_gradients:
-                grad_norm = accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                loss = outputs.loss
 
-            optimizer.step()
-            optimizer.zero_grad()
+                accelerator.backward(loss)
 
-            if accelerator.sync_gradients:
-                scheduler.step()
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
 
-        # ========================================================
-        # LOGGING
-        # ========================================================
-        if step % 10 == 0:
-            accelerator.print(f"Step {step} | Loss: {loss.item():.4f}")
-            
-            elapsed = time.time() - start_time
-            tokens = BATCH_SIZE * CONTEXT_SIZE * GRAD_ACCUM_STEPS
-            tokens_per_sec = tokens / elapsed
+                optimizer.step()
+                optimizer.zero_grad()
 
-            accelerator.log(
-                {
-                    "loss": loss.item(),
-                    "lr": scheduler.get_last_lr()[0],
-                    "grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
-                    "tokens/sec": tokens_per_sec,
-                },
-                step=step
-            )
+                if accelerator.sync_gradients:
+                    scheduler.step()
 
-            start_time = time.time()
+            # ========================================================
+            # LOGGING
+            # ========================================================
+            if global_step % 10 == 0:
+                accelerator.print(f"Epoch: {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
+                
+                elapsed = time.time() - start_time
+                tokens = BATCH_SIZE * CONTEXT_SIZE * GRAD_ACCUM_STEPS
+                tokens_per_sec = tokens / elapsed
 
-        # ========================================================
-        # SAVE CHECKPOINT
-        # ========================================================
-        if step % SAVE_EVERY == 0 and accelerator.is_main_process:
+                accelerator.log(
+                    {
+                        "loss": loss.item(),
+                        "lr": scheduler.get_last_lr()[0],
+                        "grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
+                        "tokens/sec": tokens_per_sec,
+                    },
+                    step=global_step
+                )
 
-            ckpt_path = os.path.join(CHECKPOINT_DIR, f"step_{step}")
-            os.makedirs(ckpt_path, exist_ok=True)
+                start_time = time.time()
 
-            accelerator.print(f"Saving checkpoint at step {step}")
+            # ========================================================
+            # SAVE CHECKPOINT
+            # ========================================================
+            if global_step % SAVE_EVERY == 0 and accelerator.is_main_process:
 
-            accelerator.save_state(ckpt_path)
+                ckpt_path = os.path.join(CHECKPOINT_DIR, f"step_{global_step}")
+                os.makedirs(ckpt_path, exist_ok=True)
 
-            # Inference checkpoint
-            if accelerator.is_main_process:
-                unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.save_pretrained(MODEL_PATH)
+                accelerator.print(f"Saving checkpoint at step {global_step}")
+
+                accelerator.save_state(ckpt_path)
+
+                # Save metadata
+                with open(os.path.join(ckpt_path, "meta.json"), "w") as f:
+                    json.dump({
+                        "global_step": global_step,
+                        "epoch": epoch
+                    }, f)
+
+
+                # Inference checkpoint
+                if accelerator.is_main_process:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.save_pretrained(MODEL_PATH)
 
     # ============================================================
     # FINAL SAVE
